@@ -72,35 +72,37 @@ def custom_kernel(data: input_t) -> output_t:
     # Get dimensions from output shape (M, N, L)
     m, n, l = c_out.shape
 
-    # Output tensor in final layout
+    # Fast path for L=1 (most common case)
+    if l == 1:
+        scale_a = to_blocked(sfa_cpu[:, :, 0]).cuda()
+        scale_b1 = to_blocked(sfb1_cpu[:, :, 0]).cuda()
+        scale_b2 = to_blocked(sfb2_cpu[:, :, 0]).cuda()
+
+        a_slice = a[:, :, 0]
+        b1_t = b1[:, :, 0].T
+        b2_t = b2[:, :, 0].T
+
+        r1 = torch._scaled_mm(a_slice, b1_t, scale_a, scale_b1, out_dtype=ACCUMULATOR_DTYPE)
+        r2 = torch._scaled_mm(a_slice, b2_t, scale_a, scale_b2, out_dtype=ACCUMULATOR_DTYPE)
+
+        output = (torch.nn.functional.silu(r1) * r2).to(OUTPUT_DTYPE)
+        return output.unsqueeze(-1)
+
+    # General case for L > 1
     output = torch.empty((m, n, l), dtype=OUTPUT_DTYPE, device="cuda")
 
     for l_idx in range(l):
-        # Convert scale factors to blocked format (cuBLAS layout)
         scale_a = to_blocked(sfa_cpu[:, :, l_idx]).cuda()
         scale_b1 = to_blocked(sfb1_cpu[:, :, l_idx]).cuda()
         scale_b2 = to_blocked(sfb2_cpu[:, :, l_idx]).cuda()
 
-        # Extract batch slices
         a_slice = a[:, :, l_idx]
-        b1_t = b1[:, :, l_idx].transpose(0, 1)
-        b2_t = b2[:, :, l_idx].transpose(0, 1)
+        b1_t = b1[:, :, l_idx].T
+        b2_t = b2[:, :, l_idx].T
 
-        # GEMM1: A @ B1^T -> [M, N]
-        r1 = torch._scaled_mm(
-            a_slice, b1_t,
-            scale_a, scale_b1,
-            out_dtype=ACCUMULATOR_DTYPE,
-        )
+        r1 = torch._scaled_mm(a_slice, b1_t, scale_a, scale_b1, out_dtype=ACCUMULATOR_DTYPE)
+        r2 = torch._scaled_mm(a_slice, b2_t, scale_a, scale_b2, out_dtype=ACCUMULATOR_DTYPE)
 
-        # GEMM2: A @ B2^T -> [M, N]
-        r2 = torch._scaled_mm(
-            a_slice, b2_t,
-            scale_a, scale_b2,
-            out_dtype=ACCUMULATOR_DTYPE,
-        )
-
-        # Fused SiLU + multiply: silu(r1) * r2 -> FP16
         output[:, :, l_idx] = (torch.nn.functional.silu(r1) * r2).to(OUTPUT_DTYPE)
 
     return output
