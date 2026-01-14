@@ -39,10 +39,10 @@ def custom_kernel(data: input_t) -> output_t:
         scale_b1 = sfb1_perm[:, :, :, :, :, 0].permute(2, 4, 0, 1, 3).reshape(-1).contiguous()
         scale_b2 = sfb2_perm[:, :, :, :, :, 0].permute(2, 4, 0, 1, 3).reshape(-1).contiguous()
 
-        # Get contiguous matrix slices - avoid strided access
-        a_slice = a[:, :, 0].contiguous()
-        b1_t = b1[:, :, 0].T.contiguous()
-        b2_t = b2[:, :, 0].T.contiguous()
+        # Get matrix slices (FP4 doesn't support contiguous())
+        a_slice = a[:, :, 0]
+        b1_t = b1[:, :, 0].T
+        b2_t = b2[:, :, 0].T
 
         # Dual GEMM using NVFP4 tensor cores
         r1 = torch._scaled_mm(a_slice, b1_t, scale_a, scale_b1, out_dtype=torch.float32)
@@ -61,9 +61,9 @@ def custom_kernel(data: input_t) -> output_t:
         scale_b1 = sfb1_perm[:, :, :, :, :, l_idx].permute(2, 4, 0, 1, 3).reshape(-1).contiguous()
         scale_b2 = sfb2_perm[:, :, :, :, :, l_idx].permute(2, 4, 0, 1, 3).reshape(-1).contiguous()
 
-        a_slice = a[:, :, l_idx].contiguous()
-        b1_t = b1[:, :, l_idx].T.contiguous()
-        b2_t = b2[:, :, l_idx].T.contiguous()
+        a_slice = a[:, :, l_idx]
+        b1_t = b1[:, :, l_idx].T
+        b2_t = b2[:, :, l_idx].T
 
         r1 = torch._scaled_mm(a_slice, b1_t, scale_a, scale_b1, out_dtype=torch.float32)
         r2 = torch._scaled_mm(a_slice, b2_t, scale_a, scale_b2, out_dtype=torch.float32)
