@@ -7,7 +7,7 @@
 # =============================================================================
 
 import torch
-from typing import Tuple
+from typing import Tuple, Optional, Dict
 
 # -----------------------------------------------------------------------------
 # Type aliases
