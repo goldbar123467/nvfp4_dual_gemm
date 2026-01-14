@@ -4,9 +4,6 @@ from typing import Tuple
 input_t = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 output_t = torch.Tensor
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.set_float32_matmul_precision('high')
 
 def custom_kernel(data: input_t) -> output_t:
     a, b1, b2, _, _, _, sfa_perm, sfb1_perm, sfb2_perm, c_out = data
