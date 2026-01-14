@@ -1,13 +1,13 @@
 # =============================================================================
-# NVFP4 Dual-GEMM Submission
+# NVFP4 Dual-GEMM Submission B - OPTIMIZED
 # =============================================================================
-# GPU MODE Leaderboard Submission
+# Uses pre-permuted scale factors (GPU-only, no CPU transfer)
 # Kernel: C = silu(A @ B1) * (A @ B2)
 # Target: NVIDIA B200 (SM100 Blackwell)
 # =============================================================================
 
 import torch
-from typing import Tuple, Optional, Dict
+from typing import Tuple
 
 # -----------------------------------------------------------------------------
 # Type aliases
@@ -34,8 +34,8 @@ def custom_kernel(data: input_t) -> output_t:
     Computes: C = silu(A @ B1) * (A @ B2)
 
     Optimizations:
-    - GPU-based scale factor conversion using permuted format
-    - Direct tensor operations without CPU transfers
+    - Uses pre-permuted scale factors (already on GPU)
+    - No CPU-to-GPU transfer in hot path
     - Fused SiLU + multiply epilogue
     """
     a, b1, b2, sfa, sfb1, sfb2, sfa_perm, sfb1_perm, sfb2_perm, c_out = data
@@ -44,8 +44,8 @@ def custom_kernel(data: input_t) -> output_t:
 
     # Fast path for L=1 (common case)
     if l == 1:
-        # Convert permuted -> blocked format on GPU
-        # Input: [32, 4, rest_m, 4, rest_k, L] -> blocked format for cuBLAS
+        # Use pre-permuted scale factors directly (already on GPU!)
+        # Convert: [32, 4, rest_m, 4, rest_k, 1] -> flattened blocked format
         scale_a = sfa_perm[:, :, :, :, :, 0].permute(2, 4, 0, 1, 3).reshape(-1)
         scale_b1 = sfb1_perm[:, :, :, :, :, 0].permute(2, 4, 0, 1, 3).reshape(-1)
         scale_b2 = sfb2_perm[:, :, :, :, :, 0].permute(2, 4, 0, 1, 3).reshape(-1)
