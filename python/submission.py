@@ -15,19 +15,17 @@ def custom_kernel(data):
 
         a0, b1t, b2t = a[:, :, 0], b1[:, :, 0].T, b2[:, :, 0].T
 
-        # Try FP16 output directly from scaled_mm
-        r1 = torch._scaled_mm(a0, b1t, scale_a, scale_b1, out_dtype=torch.float16)
-        r2 = torch._scaled_mm(a0, b2t, scale_a, scale_b2, out_dtype=torch.float16)
+        r1 = torch._scaled_mm(a0, b1t, scale_a, scale_b1, out_dtype=torch.float32)
+        r2 = torch._scaled_mm(a0, b2t, scale_a, scale_b2, out_dtype=torch.float32)
 
-        # Manual silu in FP16
-        return (r1 * torch.sigmoid(r1) * r2).unsqueeze(-1)
+        return (r1 * torch.sigmoid(r1) * r2).half().unsqueeze(-1)
 
     output = torch.empty((m, n, l), dtype=torch.float16, device="cuda")
     for i in range(l):
         scale_a = sfa_perm[:, :, :, :, :, i].permute(2, 4, 0, 1, 3).view(-1)
         scale_b1 = sfb1_perm[:, :, :, :, :, i].permute(2, 4, 0, 1, 3).view(-1)
         scale_b2 = sfb2_perm[:, :, :, :, :, i].permute(2, 4, 0, 1, 3).view(-1)
-        r1 = torch._scaled_mm(a[:, :, i], b1[:, :, i].T, scale_a, scale_b1, out_dtype=torch.float16)
-        r2 = torch._scaled_mm(a[:, :, i], b2[:, :, i].T, scale_a, scale_b2, out_dtype=torch.float16)
-        output[:, :, i] = r1 * torch.sigmoid(r1) * r2
+        r1 = torch._scaled_mm(a[:, :, i], b1[:, :, i].T, scale_a, scale_b1, out_dtype=torch.float32)
+        r2 = torch._scaled_mm(a[:, :, i], b2[:, :, i].T, scale_a, scale_b2, out_dtype=torch.float32)
+        output[:, :, i] = (r1 * torch.sigmoid(r1) * r2).half()
     return output
