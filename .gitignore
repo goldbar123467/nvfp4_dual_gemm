@@ -1,4 +1,31 @@
+# CUTLASS (cloned during build)
 cutlass/
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
 .pytest_cache/
+*.egg-info/
+dist/
+build/
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.o
+*.obj
+*.exe
+*.out
+
+# Logs
+*.log
