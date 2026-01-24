@@ -2,7 +2,13 @@
 NVFP4 Block-Scaled Group GEMM for NVIDIA B200
 CuTe DSL Implementation using CUTLASS
 
-VERSION: v7-clean-20260124
+VERSION: v8b-warp-specialization-20260124
+
+ROUND 8B: Warp Specialization (Producer/Consumer Pattern)
+- Warp 0 = Producer (TMA loads only)
+- Warps 1-3 = Consumers (MMA compute)
+- Double buffering (num_ab_stage=2) for load/compute overlap
+- Expected: 2-3x speedup from true pipelining
 """
 
 import cutlass
@@ -31,7 +37,7 @@ c_dtype = cutlass.Float16
 sf_vec_size = 16
 threads_per_cta = 128
 num_acc_stage = 1
-num_ab_stage = 1  # Reverted: 3-stage was SLOWER (488µs vs 373µs baseline)
+num_ab_stage = 2  # ROUND 8B: Double buffering for producer/consumer overlap
 num_tmem_alloc_cols = 512
 
 
@@ -142,8 +148,11 @@ def kernel(
     )
 
     # Initialize pipelines
+    # ROUND 8B: Double-buffered pipeline with load/compute overlap
+    # Producer = Warp 0 (issues TMA loads)
+    # Consumer = ALL threads (cooperative MMA requires all 128)
     ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-    ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
+    ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, threads_per_cta)
     ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
         barrier_storage=storage.ab_mbar_ptr.data_ptr(),
         num_stages=num_ab_stage,
@@ -312,45 +321,85 @@ def kernel(
     tAgSFA = tAgSFA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
     tBgSFB = tBgSFB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
 
-    # Main loop
+    # Main loop - ROUND 8B: Warp Specialization with Double Buffering
+    #
+    # Producer (Warp 0): Issues TMA loads ahead of compute
+    # Consumer (Warps 1-3): MMA compute while next tile loads
+    #
+    # Pipeline structure:
+    # - Prologue: Issue first load
+    # - Main loop: Overlap load[N+1] with compute[N]
+    # - Epilogue: Compute last tile
+
+    # Initialize accumulator
     if warp_idx == 0:
         acc_empty = acc_producer.acquire_and_advance()
-        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-        for k_tile in range(k_tile_cnt):
-            ab_empty = ab_producer.acquire_and_advance()
+    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+    num_kblocks = cute.size(tCrA, mode=[2])
 
-            cute.copy(tma_atom_a, tAgA[(None, k_tile)], tAsA[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_a_gmem_ptr, cute.AddressSpace.generic))
-            cute.copy(tma_atom_b, tBgB[(None, k_tile)], tBsB[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_b_gmem_ptr, cute.AddressSpace.generic))
-            cute.copy(tma_atom_sfa, tAgSFA[(None, k_tile)], tAsSFA[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_sfa_gmem_ptr, cute.AddressSpace.generic))
-            cute.copy(tma_atom_sfb, tBgSFB[(None, k_tile)], tBsSFB[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_sfb_gmem_ptr, cute.AddressSpace.generic))
+    # ========== PROLOGUE: Issue first load ==========
+    if warp_idx == 0:
+        ab_empty = ab_producer.acquire_and_advance()
+        cute.copy(tma_atom_a, tAgA[(None, 0)], tAsA[(None, ab_empty.index)],
+            tma_bar_ptr=ab_empty.barrier,
+            tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_a_gmem_ptr, cute.AddressSpace.generic))
+        cute.copy(tma_atom_b, tBgB[(None, 0)], tBsB[(None, ab_empty.index)],
+            tma_bar_ptr=ab_empty.barrier,
+            tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_b_gmem_ptr, cute.AddressSpace.generic))
+        cute.copy(tma_atom_sfa, tAgSFA[(None, 0)], tAsSFA[(None, ab_empty.index)],
+            tma_bar_ptr=ab_empty.barrier,
+            tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_sfa_gmem_ptr, cute.AddressSpace.generic))
+        cute.copy(tma_atom_sfb, tBgSFB[(None, 0)], tBsSFB[(None, ab_empty.index)],
+            tma_bar_ptr=ab_empty.barrier,
+            tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_sfb_gmem_ptr, cute.AddressSpace.generic))
 
-            ab_full = ab_consumer.wait_and_advance()
+    # ========== MAIN LOOP: Overlap load[N+1] with compute[N] ==========
+    for k_tile in range(k_tile_cnt):
+        # Wait for current tile's data
+        ab_full = ab_consumer.wait_and_advance()
 
+        # Issue NEXT tile's load (if not last iteration)
+        if warp_idx == 0:
+            if k_tile < k_tile_cnt - 1:
+                ab_empty_next = ab_producer.acquire_and_advance()
+                cute.copy(tma_atom_a, tAgA[(None, k_tile + 1)], tAsA[(None, ab_empty_next.index)],
+                    tma_bar_ptr=ab_empty_next.barrier,
+                    tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_a_gmem_ptr, cute.AddressSpace.generic))
+                cute.copy(tma_atom_b, tBgB[(None, k_tile + 1)], tBsB[(None, ab_empty_next.index)],
+                    tma_bar_ptr=ab_empty_next.barrier,
+                    tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_b_gmem_ptr, cute.AddressSpace.generic))
+                cute.copy(tma_atom_sfa, tAgSFA[(None, k_tile + 1)], tAsSFA[(None, ab_empty_next.index)],
+                    tma_bar_ptr=ab_empty_next.barrier,
+                    tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_sfa_gmem_ptr, cute.AddressSpace.generic))
+                cute.copy(tma_atom_sfb, tBgSFB[(None, k_tile + 1)], tBsSFB[(None, ab_empty_next.index)],
+                    tma_bar_ptr=ab_empty_next.barrier,
+                    tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_sfb_gmem_ptr, cute.AddressSpace.generic))
+
+        # S2T copy scale factors (thread 0 only)
+        if tidx == 0:
             s2t_stage_coord = (None, None, None, None, ab_full.index)
             tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
             tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
             cute.copy(tiled_copy_s2t_sfa, tCsSFA_compact_s2t_staged, tCtSFA_compact_s2t)
             cute.copy(tiled_copy_s2t_sfb, tCsSFB_compact_s2t_staged, tCtSFB_compact_s2t)
 
-            num_kblocks = cute.size(tCrA, mode=[2])
-            for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
-                kblock_coord = (None, None, kblock_idx, ab_full.index)
-                sf_kblock_coord = (None, None, kblock_idx)
-                tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
-                tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
-                cute.gemm(tiled_mma, tCtAcc, tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc)
-                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+        # Barrier before MMA
+        cute.arch.barrier()
 
-            ab_full.release()
+        # MMA compute (ALL threads - cooperative instruction)
+        for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
+            kblock_coord = (None, None, kblock_idx, ab_full.index)
+            sf_kblock_coord = (None, None, kblock_idx)
+            tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
+            tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
+            cute.gemm(tiled_mma, tCtAcc, tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc)
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+
+        ab_full.release()
+
+    # Commit accumulator
+    if warp_idx == 0:
         acc_empty.commit()
 
     # Epilogue

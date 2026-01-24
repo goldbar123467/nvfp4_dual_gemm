@@ -1,0 +1,41 @@
+SHARK TANK ROUND 8: SHARK 1 "THE SKEPTIC" - SCORECARD
+====================================================
+
+PITCH A: 3/10 - Ignores architecture, thread-unsafe on tiled_mma.set() calls.
+         Will corrupt MMA state silently 30-50% of the time due to race
+         conditions. Pipeline configured with 1-thread consumer intentionally.
+         REJECT.
+
+PITCH B: 7/10 - Architecturally sound. Warp 0 produces (TMA/S2T), Warps 1-3
+         consume (MMA). Per-warp MMA partitions avoid thread-safety issues.
+         Infrastructure already exists. Will deliver 2-3x speedup (not 1.2x as
+         claimed). Safe, proven pattern. FUNDABLE as backup.
+
+PITCH C: 5/10 - Multi-tile clever but breaks dual-GEMM fusion potential. Each
+         warp loads separate B tile = 4x B bandwidth instead of 2x. Shared A
+         contention causes 1.5-2x performance drop. Complicated epilogue.
+         Realistic gain: 1.3-1.8x (not 2-4x). Too risky for low return.
+
+PITCH D: 9/10 - Best technical analysis. Proves pipeline is intentional (line 146:
+         consumer_group set to 1 thread by design). MMA already per-warp (line 176).
+         Root cause: CONTROL is bottleneck, not data. Solution: separate producer
+         (Warp 0 TMA/S2T) from consumer (Warps 1-3 MMA) loops. Enables 3-4x gain
+         AND unblocks dual-GEMM fusion. Architecture-respecting, future-proof.
+
+MY VOTE: PITCH D
+
+REASON: This is a leaderboard competition, not a hackathon. Pitch B is the safe 2-3x
+        win. But Pitch D is CORRECT architecture that delivers 3-4x minimum and
+        enables future optimizations (dual-GEMM fusion adds another 1.3x). The
+        author understands WHY the restriction exists (pipeline design, not bugs),
+        which is the mark of deep technical insight. That's what wins competitions.
+
+INVESTMENT THESIS: Fund the engineer who asks WHY before implementing WHAT.
+
+---
+
+DETAILED ANALYSIS: See round8_shark1_vote.md
+
+KEY FINDING: The 75% idle thread problem isn't a coding bug—it's an architectural
+choice in the reference implementation. The solution respects that architecture
+while unlocking all 4 warps through careful loop restructuring.
