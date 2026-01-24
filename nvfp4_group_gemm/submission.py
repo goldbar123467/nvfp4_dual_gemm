@@ -2,8 +2,7 @@
 NVFP4 Block-Scaled Group GEMM for NVIDIA B200
 CuTe DSL Implementation using CUTLASS
 
-VERSION: v8-prealloc-20260124
-OPTIMIZATION: Pre-allocated tensor cache to eliminate Python overhead
+VERSION: v7-clean-20260124
 """
 
 import cutlass
@@ -20,10 +19,6 @@ from typing import Tuple, List
 
 import torch
 from task import input_t, output_t
-
-# Pre-allocation cache for metadata tensors (ROUND 6 WINNER)
-# Eliminates ~50µs of Python overhead per kernel call
-_metadata_cache = {}
 
 # Kernel configuration parameters
 bytes_per_tensormap = 128
@@ -505,35 +500,6 @@ def my_kernel(
 
 _compiled_kernel_cache = {}
 
-
-def get_cached_metadata_tensors(num_groups, total_num_clusters):
-    """
-    Get or create cached metadata tensors to avoid per-call allocation.
-
-    This eliminates ~50µs of torch.tensor() overhead per kernel call.
-    Cache key: (num_groups, total_num_clusters)
-    """
-    global _metadata_cache
-    key = (num_groups, total_num_clusters)
-
-    if key not in _metadata_cache:
-        _metadata_cache[key] = {
-            'problem_sizes': torch.empty((num_groups, 4), dtype=torch.int32, device="cuda"),
-            'abc_ptrs': torch.empty((num_groups, 3), dtype=torch.int64, device="cuda"),
-            'sfasfb_ptrs': torch.empty((num_groups, 2), dtype=torch.int64, device="cuda"),
-            'tensormap': torch.empty(
-                (total_num_clusters, num_tensormaps, bytes_per_tensormap // 8),
-                dtype=torch.int64, device="cuda"
-            ),
-            # CPU staging tensors for fast copy (pinned memory)
-            'problem_sizes_cpu': torch.empty((num_groups, 4), dtype=torch.int32, pin_memory=True),
-            'abc_ptrs_cpu': torch.empty((num_groups, 3), dtype=torch.int64, pin_memory=True),
-            'sfasfb_ptrs_cpu': torch.empty((num_groups, 2), dtype=torch.int64, pin_memory=True),
-        }
-
-    return _metadata_cache[key]
-
-
 def compile_kernel(problem_sizes):
     global _compiled_kernel_cache
     cache_key = f"{len(problem_sizes)}"
@@ -631,7 +597,19 @@ def custom_kernel(data: input_t) -> output_t:
         compiled_func = compile_kernel(problem_sizes)
         num_groups = len(abc_tensors)
 
-        # Compute total_num_clusters first (needed for cache key)
+        # Standard GROUP GEMM - run all groups in single kernel launch
+        abc_ptrs = []
+        sfasfb_ptrs = []
+        for i, ((a, b, c), (sfa_reordered, sfb_reordered), (m, n, k, l)) in enumerate(
+            zip(abc_tensors, sfasfb_reordered_tensors, problem_sizes)
+        ):
+            abc_ptrs.append((a.data_ptr(), b.data_ptr(), c.data_ptr()))
+            sfasfb_ptrs.append((sfa_reordered.data_ptr(), sfb_reordered.data_ptr()))
+
+        tensor_of_problem_sizes = torch.tensor(problem_sizes, dtype=torch.int32, device="cuda")
+        tensor_of_abc_ptrs = torch.tensor(abc_ptrs, dtype=torch.int64, device="cuda")
+        tensor_of_sfasfb_ptrs = torch.tensor(sfasfb_ptrs, dtype=torch.int64, device="cuda")
+
         cta_tile_shape_mn = [128, mma_tiler_mnk[1]]
         cluster_tile_shape_mn = tuple(x * y for x, y in zip(cta_tile_shape_mn, (1, 1)))
 
@@ -640,33 +618,8 @@ def custom_kernel(data: input_t) -> output_t:
             num_clusters_mn = tuple((x + y - 1) // y for x, y in zip((m, n), cluster_tile_shape_mn))
             total_num_clusters += functools.reduce(lambda x, y: x * y, num_clusters_mn)
 
-        # Get cached tensors (eliminates ~50µs of torch.tensor() overhead)
-        cache = get_cached_metadata_tensors(num_groups, total_num_clusters)
-
-        # Fill CPU staging tensors (fast - pinned memory)
-        for i, ((a, b, c), (sfa_reordered, sfb_reordered), (m, n, k, l)) in enumerate(
-            zip(abc_tensors, sfasfb_reordered_tensors, problem_sizes)
-        ):
-            cache['abc_ptrs_cpu'][i, 0] = a.data_ptr()
-            cache['abc_ptrs_cpu'][i, 1] = b.data_ptr()
-            cache['abc_ptrs_cpu'][i, 2] = c.data_ptr()
-            cache['sfasfb_ptrs_cpu'][i, 0] = sfa_reordered.data_ptr()
-            cache['sfasfb_ptrs_cpu'][i, 1] = sfb_reordered.data_ptr()
-            cache['problem_sizes_cpu'][i, 0] = m
-            cache['problem_sizes_cpu'][i, 1] = n
-            cache['problem_sizes_cpu'][i, 2] = k
-            cache['problem_sizes_cpu'][i, 3] = l
-
-        # Copy from pinned CPU to GPU (async, fast)
-        cache['abc_ptrs'].copy_(cache['abc_ptrs_cpu'], non_blocking=True)
-        cache['sfasfb_ptrs'].copy_(cache['sfasfb_ptrs_cpu'], non_blocking=True)
-        cache['problem_sizes'].copy_(cache['problem_sizes_cpu'], non_blocking=True)
-
-        # Use cached GPU tensors
-        tensor_of_problem_sizes = cache['problem_sizes']
-        tensor_of_abc_ptrs = cache['abc_ptrs']
-        tensor_of_sfasfb_ptrs = cache['sfasfb_ptrs']
-        tensor_of_tensormap = cache['tensormap']
+        tensormap_shape = (total_num_clusters, num_tensormaps, bytes_per_tensormap // 8)
+        tensor_of_tensormap = torch.empty(tensormap_shape, dtype=torch.int64, device="cuda")
 
         cute_ptr_of_tensor_of_abc_ptrs = make_ptr(
             cutlass.Int64, tensor_of_abc_ptrs.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
