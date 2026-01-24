@@ -590,99 +590,61 @@ def custom_kernel(data: input_t) -> output_t:
     if len(data) == 4:
         # GROUP GEMM format from gpumode evaluation
         # (abc_tensors, _, sfasfb_reordered_tensors, problem_sizes)
+        # This is regular GROUP GEMM - independent GEMMs with potentially different sizes
         abc_tensors, _, sfasfb_reordered_tensors, problem_sizes = data
         compiled_func = compile_kernel(problem_sizes)
-
-        # For dual GEMM: we have 2 groups sharing the same A matrix
-        # Group 0: A @ B1 -> temp1
-        # Group 1: A @ B2 -> temp2
         num_groups = len(abc_tensors)
 
-        if num_groups == 2:
-            # Dual GEMM case: compute both GEMMs, then fuse with silu
-            a, b1, c1 = abc_tensors[0]
-            _, b2, c2 = abc_tensors[1]
-            sfa1, sfb1 = sfasfb_reordered_tensors[0]
-            sfa2, sfb2 = sfasfb_reordered_tensors[1]
+        # Standard GROUP GEMM - run all groups
+        abc_ptrs = []
+        sfasfb_ptrs = []
+        for i, ((a, b, c), (sfa_reordered, sfb_reordered), (m, n, k, l)) in enumerate(
+            zip(abc_tensors, sfasfb_reordered_tensors, problem_sizes)
+        ):
+            abc_ptrs.append((a.data_ptr(), b.data_ptr(), c.data_ptr()))
+            sfasfb_ptrs.append((sfa_reordered.data_ptr(), sfb_reordered.data_ptr()))
 
-            # Allocate temp buffers for both GEMM results
-            temp1 = torch.empty_like(c1)
-            temp2 = torch.empty_like(c1)
+        tensor_of_problem_sizes = torch.tensor(problem_sizes, dtype=torch.int32, device="cuda")
+        tensor_of_abc_ptrs = torch.tensor(abc_ptrs, dtype=torch.int64, device="cuda")
+        tensor_of_sfasfb_ptrs = torch.tensor(sfasfb_ptrs, dtype=torch.int64, device="cuda")
 
-            # Run GEMM1: A @ B1 -> temp1
-            run_single_gemm(a, b1, sfa1, sfb1, temp1, [problem_sizes[0]])
+        cta_tile_shape_mn = [128, mma_tiler_mnk[1]]
+        cluster_tile_shape_mn = tuple(x * y for x, y in zip(cta_tile_shape_mn, (1, 1)))
 
-            # Run GEMM2: A @ B2 -> temp2
-            run_single_gemm(a, b2, sfa2, sfb2, temp2, [problem_sizes[1]])
+        total_num_clusters = 0
+        for m, n, _, _ in problem_sizes:
+            num_clusters_mn = tuple((x + y - 1) // y for x, y in zip((m, n), cluster_tile_shape_mn))
+            total_num_clusters += functools.reduce(lambda x, y: x * y, num_clusters_mn)
 
-            # Ensure CUDA operations complete
-            torch.cuda.synchronize()
+        tensormap_shape = (total_num_clusters, num_tensormaps, bytes_per_tensormap // 8)
+        tensor_of_tensormap = torch.empty(tensormap_shape, dtype=torch.int64, device="cuda")
 
-            # Fuse: C = silu(GEMM1) * GEMM2
-            temp1_fp32 = temp1.float()
-            temp2_fp32 = temp2.float()
-            result = (torch.nn.functional.silu(temp1_fp32) * temp2_fp32).to(c1.dtype)
+        cute_ptr_of_tensor_of_abc_ptrs = make_ptr(
+            cutlass.Int64, tensor_of_abc_ptrs.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+        cute_ptr_of_tensor_of_sfasfb_ptrs = make_ptr(
+            cutlass.Int64, tensor_of_sfasfb_ptrs.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+        cute_ptr_of_tensor_of_problem_sizes = make_ptr(
+            cutlass.Int32, tensor_of_problem_sizes.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+        cute_ptr_of_tensor_of_tensormap = make_ptr(
+            cutlass.Int64, tensor_of_tensormap.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
 
-            # Write result to both output tensors (evaluation may check both)
-            c1.copy_(result)
-            c2.copy_(result)
+        compiled_func(
+            cute_ptr_of_tensor_of_problem_sizes,
+            cute_ptr_of_tensor_of_abc_ptrs,
+            cute_ptr_of_tensor_of_sfasfb_ptrs,
+            cute_ptr_of_tensor_of_tensormap,
+            total_num_clusters,
+            problem_sizes,
+            num_groups,
+        )
 
-            # Ensure copy completes
-            torch.cuda.synchronize()
+        # Ensure CUDA operations complete
+        torch.cuda.synchronize()
 
-            # Return outputs for both groups
-            return [c1, c2]
-        else:
-            # Single GEMM case (fallback to original behavior)
-            abc_ptrs = []
-            sfasfb_ptrs = []
-            for i, ((a, b, c), (sfa_reordered, sfb_reordered), (m, n, k, l)) in enumerate(
-                zip(abc_tensors, sfasfb_reordered_tensors, problem_sizes)
-            ):
-                abc_ptrs.append((a.data_ptr(), b.data_ptr(), c.data_ptr()))
-                sfasfb_ptrs.append((sfa_reordered.data_ptr(), sfb_reordered.data_ptr()))
-
-            tensor_of_problem_sizes = torch.tensor(problem_sizes, dtype=torch.int32, device="cuda")
-            tensor_of_abc_ptrs = torch.tensor(abc_ptrs, dtype=torch.int64, device="cuda")
-            tensor_of_sfasfb_ptrs = torch.tensor(sfasfb_ptrs, dtype=torch.int64, device="cuda")
-
-            cta_tile_shape_mn = [128, mma_tiler_mnk[1]]
-            cluster_tile_shape_mn = tuple(x * y for x, y in zip(cta_tile_shape_mn, (1, 1)))
-
-            total_num_clusters = 0
-            for m, n, _, _ in problem_sizes:
-                num_clusters_mn = tuple((x + y - 1) // y for x, y in zip((m, n), cluster_tile_shape_mn))
-                total_num_clusters += functools.reduce(lambda x, y: x * y, num_clusters_mn)
-
-            tensormap_shape = (total_num_clusters, num_tensormaps, bytes_per_tensormap // 8)
-            tensor_of_tensormap = torch.empty(tensormap_shape, dtype=torch.int64, device="cuda")
-
-            cute_ptr_of_tensor_of_abc_ptrs = make_ptr(
-                cutlass.Int64, tensor_of_abc_ptrs.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-            cute_ptr_of_tensor_of_sfasfb_ptrs = make_ptr(
-                cutlass.Int64, tensor_of_sfasfb_ptrs.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-            cute_ptr_of_tensor_of_problem_sizes = make_ptr(
-                cutlass.Int32, tensor_of_problem_sizes.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-            cute_ptr_of_tensor_of_tensormap = make_ptr(
-                cutlass.Int64, tensor_of_tensormap.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-
-            compiled_func(
-                cute_ptr_of_tensor_of_problem_sizes,
-                cute_ptr_of_tensor_of_abc_ptrs,
-                cute_ptr_of_tensor_of_sfasfb_ptrs,
-                cute_ptr_of_tensor_of_tensormap,
-                total_num_clusters,
-                problem_sizes,
-                num_groups,
-            )
-
-            # Ensure CUDA operations complete
-            torch.cuda.synchronize()
-
-            res = []
-            for i in range(num_groups):
-                res.append(abc_tensors[i][2])
-            return res
+        res = []
+        for i in range(num_groups):
+            res.append(abc_tensors[i][2])
+        return res
 
     else:
         # TASK format (10 elements) from local testing
