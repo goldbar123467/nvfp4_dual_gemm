@@ -62,8 +62,9 @@ def custom_kernel(data: input_t) -> output_t:
         scale_b = get_blocked_from_reordered(sfb_reordered)
 
         # Get FP4 views - extract L=0 dimension
+        # Note: Cannot use .contiguous() on Float4_e2m1fn_x2 (copy_ not implemented)
         a_fp4 = a[:, :, 0].view(torch.float4_e2m1fn_x2)
-        b_fp4 = b[:, :, 0].transpose(0, 1).contiguous().view(torch.float4_e2m1fn_x2)
+        b_fp4 = b[:, :, 0].transpose(0, 1).view(torch.float4_e2m1fn_x2)
 
         # Execute scaled matrix multiplication with fast accumulation
         result = torch._scaled_mm(
