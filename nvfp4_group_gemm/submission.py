@@ -21,7 +21,7 @@ from task import input_t, output_t
 # Kernel configuration parameters
 bytes_per_tensormap = 128
 num_tensormaps = 4
-mma_tiler_mnk = (128, 128, 256)
+mma_tiler_mnk = (64, 128, 256)  # Shark Tank Round 2 Winner: smaller M tile for better SM utilization
 mma_inst_shape_k = 64
 ab_dtype = cutlass.Float4E2M1FN
 sf_dtype = cutlass.Float8E4M3FN
@@ -29,7 +29,7 @@ c_dtype = cutlass.Float16
 sf_vec_size = 16
 threads_per_cta = 128
 num_acc_stage = 1
-num_ab_stage = 3  # Multi-stage pipeline: overlaps memory latency with compute (Shark Tank Round 1 Winner)
+num_ab_stage = 1  # Reverted: 3-stage was SLOWER (488µs vs 373µs baseline)
 num_tmem_alloc_cols = 512
 
 
