@@ -2,7 +2,8 @@
 NVFP4 Block-Scaled Group GEMM for NVIDIA B200
 CuTe DSL Implementation using CUTLASS
 
-VERSION: v7-clean-20260124
+VERSION: v6-nostream-20260124
+VERIFY: This file has NO CUDA streams. Search for 'torch.cuda.Stream' - 0 matches.
 """
 
 import cutlass
