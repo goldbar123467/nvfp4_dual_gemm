@@ -592,56 +592,35 @@ def custom_kernel(data: input_t) -> output_t:
         # (abc_tensors, _, sfasfb_reordered_tensors, problem_sizes)
         # This is regular GROUP GEMM - independent GEMMs with potentially different sizes
         abc_tensors, _, sfasfb_reordered_tensors, problem_sizes = data
-        compiled_func = compile_kernel(problem_sizes)
         num_groups = len(abc_tensors)
 
-        # Standard GROUP GEMM - run all groups
-        abc_ptrs = []
-        sfasfb_ptrs = []
-        for i, ((a, b, c), (sfa_reordered, sfb_reordered), (m, n, k, l)) in enumerate(
-            zip(abc_tensors, sfasfb_reordered_tensors, problem_sizes)
-        ):
-            abc_ptrs.append((a.data_ptr(), b.data_ptr(), c.data_ptr()))
-            sfasfb_ptrs.append((sfa_reordered.data_ptr(), sfb_reordered.data_ptr()))
+        # STREAM PARALLELISM: Launch each group on a separate CUDA stream
+        # This allows groups to run in parallel on the GPU's 192 SMs
+        if num_groups > 1:
+            # Create streams for parallel execution
+            streams = [torch.cuda.Stream() for _ in range(num_groups)]
 
-        tensor_of_problem_sizes = torch.tensor(problem_sizes, dtype=torch.int32, device="cuda")
-        tensor_of_abc_ptrs = torch.tensor(abc_ptrs, dtype=torch.int64, device="cuda")
-        tensor_of_sfasfb_ptrs = torch.tensor(sfasfb_ptrs, dtype=torch.int64, device="cuda")
+            # Launch each group on its own stream
+            for i, ((a, b, c), (sfa_reordered, sfb_reordered), ps) in enumerate(
+                zip(abc_tensors, sfasfb_reordered_tensors, problem_sizes)
+            ):
+                with torch.cuda.stream(streams[i]):
+                    run_single_gemm(a, b, sfa_reordered, sfb_reordered, c, [ps])
 
-        cta_tile_shape_mn = [128, mma_tiler_mnk[1]]
-        cluster_tile_shape_mn = tuple(x * y for x, y in zip(cta_tile_shape_mn, (1, 1)))
+            # Wait for all streams to complete
+            for stream in streams:
+                stream.synchronize()
 
-        total_num_clusters = 0
-        for m, n, _, _ in problem_sizes:
-            num_clusters_mn = tuple((x + y - 1) // y for x, y in zip((m, n), cluster_tile_shape_mn))
-            total_num_clusters += functools.reduce(lambda x, y: x * y, num_clusters_mn)
-
-        tensormap_shape = (total_num_clusters, num_tensormaps, bytes_per_tensormap // 8)
-        tensor_of_tensormap = torch.empty(tensormap_shape, dtype=torch.int64, device="cuda")
-
-        cute_ptr_of_tensor_of_abc_ptrs = make_ptr(
-            cutlass.Int64, tensor_of_abc_ptrs.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-        cute_ptr_of_tensor_of_sfasfb_ptrs = make_ptr(
-            cutlass.Int64, tensor_of_sfasfb_ptrs.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-        cute_ptr_of_tensor_of_problem_sizes = make_ptr(
-            cutlass.Int32, tensor_of_problem_sizes.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-        cute_ptr_of_tensor_of_tensormap = make_ptr(
-            cutlass.Int64, tensor_of_tensormap.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-
-        compiled_func(
-            cute_ptr_of_tensor_of_problem_sizes,
-            cute_ptr_of_tensor_of_abc_ptrs,
-            cute_ptr_of_tensor_of_sfasfb_ptrs,
-            cute_ptr_of_tensor_of_tensormap,
-            total_num_clusters,
-            problem_sizes,
-            num_groups,
-        )
-
-        res = []
-        for i in range(num_groups):
-            res.append(abc_tensors[i][2])
-        return res
+            res = []
+            for i in range(num_groups):
+                res.append(abc_tensors[i][2])
+            return res
+        else:
+            # Single group - no need for streams
+            a, b, c = abc_tensors[0]
+            sfa_reordered, sfb_reordered = sfasfb_reordered_tensors[0]
+            run_single_gemm(a, b, sfa_reordered, sfb_reordered, c, problem_sizes)
+            return [c]
 
     else:
         # TASK format (10 elements) from local testing
