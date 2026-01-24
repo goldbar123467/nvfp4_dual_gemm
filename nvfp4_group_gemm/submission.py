@@ -21,7 +21,7 @@ from task import input_t, output_t
 # Kernel configuration parameters
 bytes_per_tensormap = 128
 num_tensormaps = 4
-mma_tiler_mnk = (64, 128, 256)  # Shark Tank Round 2 Winner: smaller M tile for better SM utilization
+mma_tiler_mnk = (128, 64, 256)  # Round 2 Fix: M=128 required by hardware, trying smaller N instead
 mma_inst_shape_k = 64
 ab_dtype = cutlass.Float4E2M1FN
 sf_dtype = cutlass.Float8E4M3FN
