@@ -1,11 +1,31 @@
 # CONTEXT FOR NEXT ROUND
 
-## TL;DR - THE KERNEL IS WRONG
+## TL;DR - ROUND 4 FIX IMPLEMENTED
 
 **Task requires:** `C = silu(A @ B1) * (A @ B2)` (dual GEMM with SiLU fusion)
-**Kernel computes:** `C = A @ B` (single GEMM, no silu, no second gemm)
+**Round 4 fix:** Two-Pass approach - call single GEMM twice, fuse in PyTorch
 
-This is why we're 20-100x off target.
+---
+
+## ROUND 4 IMPLEMENTATION
+
+The `solve()` function in submission.py now implements:
+
+```python
+def solve(data: input_t) -> output_t:
+    # Unpack: (a, b1, b2, sfa, sfb1, sfb2, sfa_perm, sfb1_perm, sfb2_perm, c)
+    a, b1, b2, sfa, sfb1, sfb2, sfa_perm, sfb1_perm, sfb2_perm, c = data
+
+    # Pass 1: GEMM1 = A @ B1
+    run_single_gemm(a, b1, sfa_perm, sfb1_perm, temp1, problem_sizes)
+
+    # Pass 2: GEMM2 = A @ B2
+    run_single_gemm(a, b2, sfa_perm, sfb2_perm, temp2, problem_sizes)
+
+    # Fuse: C = silu(GEMM1) * GEMM2
+    result = silu(temp1.float()) * temp2.float()
+    c.copy_(result.half())
+```
 
 ---
 
@@ -28,64 +48,29 @@ mma_tiler_mnk = (128, 128, 256)
 
 ---
 
-## WHAT NEEDS TO BE IMPLEMENTED
+## NEXT OPTIMIZATIONS (After Validation)
 
-Current kernel mainloop (lines 314-352 in submission.py):
-- Loads A, B, SFA, SFB
-- Computes ONE gemm: `acc = A @ B`
-- Stores result
-
-Needed:
-1. Load A, B1, B2, SFA, SFB1, SFB2
-2. Compute acc1 = A @ B1
-3. Compute acc2 = A @ B2 (reuse A from shared memory!)
-4. Epilogue: C = silu(acc1) * acc2
+1. **Interleaved Dual GEMM**: Compute both in mainloop, reuse A tiles
+2. **Fused Epilogue**: Move silu + multiply into GPU kernel
+3. **TMA Store Epilogue**: Replace SIMT stores with TMA hardware
+4. **Warp Specialization**: Producer/consumer architecture
 
 ---
 
-## INPUT STRUCTURE (from task.md)
+## FILES MODIFIED
 
-```python
-# Input tuple:
-(a, b1, b2, sfa, sfb1, sfb2, c)
-
-# But current kernel only uses:
-(a, b, sfa, sfb, c)  # Missing b2 and sfb2!
-```
-
----
-
-## BASELINE PERFORMANCE
-
-```
-g=8, K=7168: ~400-460 µs (target: 18.8 µs)
-g=8, K=2048: ~400-440 µs (target: 10.7 µs)
-g=2, K=4096: ~170-245 µs (target: 2.4 µs)
-g=2, K=1536: ~150-222 µs (target: 1.5 µs)
-```
-
----
-
-## KEY INSIGHT
-
-The "optimization" that will give us the biggest speedup is **actually implementing the correct algorithm**. Once we compute dual GEMM with SiLU, we can then optimize:
-- TMA store epilogue (5-10%)
-- Warp specialization (10-20%)
-- Interleaved dual GEMM computation
-
----
-
-## FILES TO MODIFY
-
-- `/home/clark/nvfp4_dual_gemm_repo/nvfp4_group_gemm/submission.py`
-- `/home/clark/nvfp4_group_gemm/submission.py` (test copy)
+- `/home/clark/nvfp4_dual_gemm_repo/nvfp4_group_gemm/submission.py` - UPDATED
+- `/home/clark/nvfp4_group_gemm/submission.py` - COPIED
 
 ---
 
 ## SHARK TANK SCORE
 
-- Round 1: Pipeline Stages - FAILED
-- Round 2: Tile Tuning - FAILED
-- Round 3: Wild Card - DISCOVERED THE BUG
+| Round | Winner | Expected | Actual |
+|-------|--------|----------|--------|
+| 1 | Pipeline Stages | 1.5x faster | 30% SLOWER |
+| 2 | Tile Tuning | 2-3x faster | COMPILE ERROR |
+| 3 | Wild Card | ??? | Found the bug |
+| 4 | Minimal Fix | Correctness | IMPLEMENTED |
 
-**Round 4 Goal:** Implement the actual dual GEMM with SiLU fusion
+**Status:** Awaiting user testing

@@ -525,18 +525,13 @@ def compile_kernel(problem_sizes):
     return compiled_func
 
 
-def custom_kernel(data: input_t) -> output_t:
-    """Execute the block-scaled group GEMM kernel."""
-    abc_tensors, _, sfasfb_reordered_tensors, problem_sizes = data
+def run_single_gemm(a, b, sfa_perm, sfb_perm, output, problem_sizes):
+    """Execute a single block-scaled GEMM: output = A @ B."""
     compiled_func = compile_kernel(problem_sizes)
 
-    abc_ptrs = []
-    sfasfb_ptrs = []
-    for i, ((a, b, c), (sfa_reordered, sfb_reordered), (m, n, k, l)) in enumerate(
-        zip(abc_tensors, sfasfb_reordered_tensors, problem_sizes)
-    ):
-        abc_ptrs.append((a.data_ptr(), b.data_ptr(), c.data_ptr()))
-        sfasfb_ptrs.append((sfa_reordered.data_ptr(), sfb_reordered.data_ptr()))
+    # Create pointer arrays for the kernel
+    abc_ptrs = [(a.data_ptr(), b.data_ptr(), output.data_ptr())]
+    sfasfb_ptrs = [(sfa_perm.data_ptr(), sfb_perm.data_ptr())]
 
     tensor_of_problem_sizes = torch.tensor(problem_sizes, dtype=torch.int32, device="cuda")
     tensor_of_abc_ptrs = torch.tensor(abc_ptrs, dtype=torch.int64, device="cuda")
@@ -573,12 +568,50 @@ def custom_kernel(data: input_t) -> output_t:
         num_groups,
     )
 
-    res = []
-    for i in range(num_groups):
-        res.append(abc_tensors[i][2])
-    return res
+    return output
 
 
 def solve(data: input_t) -> output_t:
-    """Main entry point for the NVFP4 group GEMM solution."""
-    return custom_kernel(data)
+    """
+    Main entry point for NVFP4 dual GEMM with SiLU fusion.
+
+    Computes: C = silu(A @ B1) * (A @ B2)
+
+    Two-Pass Implementation:
+    1. GEMM1 = A @ B1 (with block scaling)
+    2. GEMM2 = A @ B2 (with block scaling)
+    3. C = silu(GEMM1) * GEMM2 (fused in PyTorch)
+    """
+    # Unpack task input format:
+    # (a, b1, b2, sfa, sfb1, sfb2, sfa_perm, sfb1_perm, sfb2_perm, c)
+    a, b1, b2, sfa, sfb1, sfb2, sfa_perm, sfb1_perm, sfb2_perm, c = data
+
+    # Get dimensions from output tensor [M, N, L]
+    m, n, l = c.shape
+    # K dimension from A tensor shape [M, K//2, L] -> K = shape[1] * 2
+    k = a.shape[1] * 2
+
+    # Problem sizes for the kernel
+    problem_sizes = [(m, n, k, l)]
+
+    # Allocate temporary buffers for GEMM results (fp16 like output)
+    temp1 = torch.empty_like(c)
+    temp2 = torch.empty_like(c)
+
+    # Pass 1: GEMM1 = A @ B1
+    run_single_gemm(a, b1, sfa_perm, sfb1_perm, temp1, problem_sizes)
+
+    # Pass 2: GEMM2 = A @ B2
+    run_single_gemm(a, b2, sfa_perm, sfb2_perm, temp2, problem_sizes)
+
+    # Fuse: C = silu(GEMM1) * GEMM2
+    # silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    # Compute in fp32 for numerical stability, then convert back to fp16
+    temp1_fp32 = temp1.float()
+    temp2_fp32 = temp2.float()
+    result = (torch.nn.functional.silu(temp1_fp32) * temp2_fp32).to(c.dtype)
+
+    # Copy result to output tensor
+    c.copy_(result)
+
+    return c

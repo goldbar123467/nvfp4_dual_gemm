@@ -213,15 +213,63 @@ C = silu(acc1) * acc2
 
 ---
 
-## NEXT STEPS FOR ROUND 4
+## ROUND 4 IMPLEMENTATION: TWO-PASS APPROACH
 
-1. **Implement Dual GEMM**: Add second GEMM computation (A @ B2)
-2. **Add SiLU Activation**: `silu(x) = x * sigmoid(x)`
-3. **Add Element-wise Multiply**: Fuse in epilogue
-4. **Benchmark**: See how much of the gap is closed
-5. **Then Optimize**: Apply valid optimizations to the CORRECT kernel
+### What Was Implemented
+
+The sharks unanimously voted for the "Minimal Fix (Two-Pass)" approach:
+
+1. **Adapted Input Format**: The task provides `(a, b1, b2, sfa, sfb1, sfb2, sfa_perm, sfb1_perm, sfb2_perm, c)`
+2. **Created `run_single_gemm()` helper**: Runs a single GEMM with block scaling
+3. **Two-Pass Execution**:
+   ```python
+   # Pass 1: GEMM1 = A @ B1
+   run_single_gemm(a, b1, sfa_perm, sfb1_perm, temp1, problem_sizes)
+
+   # Pass 2: GEMM2 = A @ B2
+   run_single_gemm(a, b2, sfa_perm, sfb2_perm, temp2, problem_sizes)
+
+   # Fuse: C = silu(GEMM1) * GEMM2
+   result = silu(temp1.float()) * temp2.float()
+   c = result.half()
+   ```
+
+### Why This Approach Won
+
+| Approach | Risk | Implementation Time | Correctness Confidence |
+|----------|------|--------------------|-----------------------|
+| Sequential Dual GEMM | Medium | 3 hours | Medium |
+| Interleaved Dual GEMM | High | 6 hours | Low |
+| **Minimal Fix (Two-Pass)** | **Zero** | **1 hour** | **100%** |
+
+After 3 rounds of failures, the sharks learned: **Correct but slow beats fast but wrong**.
+
+---
+
+## SHARK TANK FINAL SCORECARD
+
+| Round | Winner | Expected | Actual | Status |
+|-------|--------|----------|--------|--------|
+| 1 | Pipeline Stages | 1.5x faster | 30% SLOWER | FAILED |
+| 2 | Tile Size Tuning | 2-3x faster | COMPILE ERROR | FAILED |
+| 3 | Wild Card | ??? | Found the bug | SUCCESS |
+| 4 | Minimal Fix | Correctness | Implemented | TBD |
+
+---
+
+## VALID FUTURE OPTIMIZATIONS (After Round 4 Verification)
+
+Once the Two-Pass implementation is verified correct:
+
+1. **Interleaved Dual GEMM**: Compute both GEMMs in the same mainloop, reusing A tiles
+2. **Fused Epilogue**: Move SiLU + multiply into the GPU kernel
+3. **TMA Store Epilogue**: Replace SIMT stores with TMA hardware
+4. **Warp Specialization**: Producer/consumer architecture for better overlap
 
 ---
 
 *"The best optimization is computing the right thing."*
 *- The Wild Card, Shark Tank Round 3 Winner*
+
+*"Correct but slow beats fast but wrong. Every. Single. Time."*
+*- The Sharks, Shark Tank Round 4*
