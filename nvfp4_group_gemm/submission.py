@@ -638,9 +638,6 @@ def custom_kernel(data: input_t) -> output_t:
             num_groups,
         )
 
-        # Ensure CUDA operations complete
-        torch.cuda.synchronize()
-
         res = []
         for i in range(num_groups):
             res.append(abc_tensors[i][2])
@@ -669,9 +666,6 @@ def custom_kernel(data: input_t) -> output_t:
         # Pass 2: GEMM2 = A @ B2
         run_single_gemm(a, b2, sfa_perm, sfb2_perm, temp2, problem_sizes)
 
-        # Ensure CUDA operations complete
-        torch.cuda.synchronize()
-
         # Fuse: C = silu(GEMM1) * GEMM2
         temp1_fp32 = temp1.float()
         temp2_fp32 = temp2.float()
@@ -679,9 +673,6 @@ def custom_kernel(data: input_t) -> output_t:
 
         # Copy result to output tensor
         c.copy_(result)
-
-        # Ensure copy completes
-        torch.cuda.synchronize()
 
         return c
 
