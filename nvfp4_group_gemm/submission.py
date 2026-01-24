@@ -1,6 +1,7 @@
 """
 NVFP4 Block-Scaled Group GEMM for NVIDIA B200
 CuTe DSL Implementation using CUTLASS
+Note: Single-stream execution only (competition requirement)
 """
 
 import cutlass
