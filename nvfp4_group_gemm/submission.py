@@ -160,6 +160,7 @@ def kernel(
         consumer_group=ab_pipeline_consumer_group,
         tx_count=num_tma_load_bytes,
     ).make_participants()
+    # ROUND 8B: Make acc_producer group match ab_producer for consistency
     acc_producer, acc_consumer = pipeline.PipelineUmmaAsync.create(
         barrier_storage=storage.acc_mbar_ptr.data_ptr(),
         num_stages=num_acc_stage,
@@ -321,24 +322,20 @@ def kernel(
     tAgSFA = tAgSFA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
     tBgSFB = tBgSFB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
 
-    # Main loop - ROUND 8B: Warp Specialization with Double Buffering
+    # Main loop - ROUND 8B: Double Buffering with Pipelined Loads
     #
-    # Producer (Warp 0): Issues TMA loads ahead of compute
-    # Consumer (Warps 1-3): MMA compute while next tile loads
-    #
-    # Pipeline structure:
-    # - Prologue: Issue first load
-    # - Main loop: Overlap load[N+1] with compute[N]
-    # - Epilogue: Compute last tile
+    # Key optimizations:
+    # 1. Double buffering (num_ab_stage=2) for load/compute overlap
+    # 2. ALL threads participate in MMA (cooperative instruction)
+    # 3. Warp 0 handles TMA loads (hardware requirement)
 
-    # Initialize accumulator
-    if warp_idx == 0:
-        acc_empty = acc_producer.acquire_and_advance()
-
-    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
     num_kblocks = cute.size(tCrA, mode=[2])
 
-    # ========== PROLOGUE: Issue first load ==========
+    # ALL THREADS: Acquire accumulator (pipeline handles coordination)
+    acc_empty = acc_producer.acquire_and_advance()
+    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+
+    # ========== PROLOGUE: Warp 0 issues first load ==========
     if warp_idx == 0:
         ab_empty = ab_producer.acquire_and_advance()
         cute.copy(tma_atom_a, tAgA[(None, 0)], tAsA[(None, ab_empty.index)],
@@ -354,12 +351,12 @@ def kernel(
             tma_bar_ptr=ab_empty.barrier,
             tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_sfb_gmem_ptr, cute.AddressSpace.generic))
 
-    # ========== MAIN LOOP: Overlap load[N+1] with compute[N] ==========
+    # ========== MAIN LOOP ==========
     for k_tile in range(k_tile_cnt):
-        # Wait for current tile's data
+        # ALL THREADS: Wait for current tile's data
         ab_full = ab_consumer.wait_and_advance()
 
-        # Issue NEXT tile's load (if not last iteration)
+        # WARP 0: Issue NEXT tile's load (overlaps with compute below)
         if warp_idx == 0:
             if k_tile < k_tile_cnt - 1:
                 ab_empty_next = ab_producer.acquire_and_advance()
@@ -376,7 +373,7 @@ def kernel(
                     tma_bar_ptr=ab_empty_next.barrier,
                     tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_sfb_gmem_ptr, cute.AddressSpace.generic))
 
-        # S2T copy scale factors (thread 0 only)
+        # THREAD 0: S2T copy scale factors
         if tidx == 0:
             s2t_stage_coord = (None, None, None, None, ab_full.index)
             tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
@@ -384,10 +381,10 @@ def kernel(
             cute.copy(tiled_copy_s2t_sfa, tCsSFA_compact_s2t_staged, tCtSFA_compact_s2t)
             cute.copy(tiled_copy_s2t_sfb, tCsSFB_compact_s2t_staged, tCtSFB_compact_s2t)
 
-        # Barrier before MMA
+        # BARRIER: Ensure S2T complete before MMA
         cute.arch.barrier()
 
-        # MMA compute (ALL threads - cooperative instruction)
+        # ALL THREADS: MMA compute (cooperative instruction)
         for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
             kblock_coord = (None, None, kblock_idx, ab_full.index)
             sf_kblock_coord = (None, None, kblock_idx)
@@ -398,9 +395,8 @@ def kernel(
 
         ab_full.release()
 
-    # Commit accumulator
-    if warp_idx == 0:
-        acc_empty.commit()
+    # ALL THREADS: Commit accumulator
+    acc_empty.commit()
 
     # Epilogue
     op = tcgen05.Ld32x32bOp(tcgen05.Repetition.x128, tcgen05.Pack.NONE)
