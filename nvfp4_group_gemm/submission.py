@@ -29,7 +29,7 @@ c_dtype = cutlass.Float16
 sf_vec_size = 16
 threads_per_cta = 128
 num_acc_stage = 1
-num_ab_stage = 1
+num_ab_stage = 3  # Multi-stage pipeline: overlaps memory latency with compute (Shark Tank Round 1 Winner)
 num_tmem_alloc_cols = 512
 
 
