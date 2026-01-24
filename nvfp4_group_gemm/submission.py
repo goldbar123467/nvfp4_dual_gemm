@@ -571,7 +571,7 @@ def run_single_gemm(a, b, sfa_perm, sfb_perm, output, problem_sizes):
     return output
 
 
-def solve(data: input_t) -> output_t:
+def custom_kernel(data: input_t) -> output_t:
     """
     Main entry point for NVFP4 dual GEMM with SiLU fusion.
 
@@ -615,3 +615,8 @@ def solve(data: input_t) -> output_t:
     c.copy_(result)
 
     return c
+
+
+def solve(data: input_t) -> output_t:
+    """Alias for custom_kernel - main entry point."""
+    return custom_kernel(data)
