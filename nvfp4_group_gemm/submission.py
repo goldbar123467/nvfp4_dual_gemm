@@ -2,9 +2,9 @@
 NVFP4 Block-Scaled Group GEMM for NVIDIA B200
 CuTe DSL Implementation using CUTLASS
 
-VERSION: v8b-warp-specialization-20260124
+VERSION: v8b-fix2-20260124
 
-ROUND 8B: Warp Specialization (Producer/Consumer Pattern)
+ROUND 8B FIX: DSL Variable Scoping Corrected
 - Warp 0 = Producer (TMA loads only)
 - Warps 1-3 = Consumers (MMA compute)
 - Double buffering (num_ab_stage=2) for load/compute overlap
