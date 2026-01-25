@@ -984,25 +984,33 @@ def custom_kernel(data: input_t) -> output_t:
                     # Fall back to simple PyTorch scaled_mm for each group
                     print(f"[DEBUG R14] GROUP GEMM mode: {num_groups} independent problems", file=sys.stderr)
 
-                    from common.scale_helpers import to_blocked
-
                     for i, (abc_group, sf_group) in enumerate(zip(abc_tensors, sfasfb_reordered_tensors)):
                         a_i, b_i, c_i = abc_group
                         sfa_i, sfb_i = sf_group
 
                         # For each group, run single scaled GEMM: c = a @ b
                         # Handle the L dimension (batch)
-                        m_i, k_half_i, l_i = a_i.shape
-                        n_i = b_i.shape[0]
+                        l_i = a_i.shape[2] if a_i.dim() > 2 else 1
 
                         for l_idx in range(l_i):
                             # Get 2D slices
-                            a_2d = a_i[:, :, l_idx]
-                            b_2d = b_i[:, :, l_idx]
+                            a_2d = a_i[:, :, l_idx] if a_i.dim() > 2 else a_i
+                            b_2d = b_i[:, :, l_idx] if b_i.dim() > 2 else b_i
 
-                            # Scale factors need to be in blocked format
-                            sfa_2d = sfa_i[..., l_idx] if sfa_i.dim() > 2 else sfa_i
-                            sfb_2d = sfb_i[..., l_idx] if sfb_i.dim() > 2 else sfb_i
+                            # Scale factors - handle various dimensions
+                            if sfa_i.dim() > 2:
+                                sfa_2d = sfa_i[..., l_idx]
+                            elif sfa_i.dim() == 2:
+                                sfa_2d = sfa_i
+                            else:
+                                sfa_2d = sfa_i.view(-1, sfa_i.shape[-1]) if sfa_i.dim() > 0 else sfa_i
+
+                            if sfb_i.dim() > 2:
+                                sfb_2d = sfb_i[..., l_idx]
+                            elif sfb_i.dim() == 2:
+                                sfb_2d = sfb_i
+                            else:
+                                sfb_2d = sfb_i.view(-1, sfb_i.shape[-1]) if sfb_i.dim() > 0 else sfb_i
 
                             # Use torch._scaled_mm for FP4 GEMM
                             result = torch._scaled_mm(
@@ -1013,7 +1021,10 @@ def custom_kernel(data: input_t) -> output_t:
                                 bias=None,
                                 out_dtype=torch.float32
                             )
-                            c_i[:, :, l_idx] = result.to(torch.float16)
+                            if c_i.dim() > 2:
+                                c_i[:, :, l_idx] = result.to(torch.float16)
+                            else:
+                                c_i.copy_(result.to(torch.float16))
 
                         print(f"[DEBUG R14] Group {i}: a={a_i.shape}, b={b_i.shape}, c={c_i.shape}", file=sys.stderr)
 
