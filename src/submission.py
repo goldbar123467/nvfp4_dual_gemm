@@ -951,40 +951,74 @@ def custom_kernel(data: input_t) -> output_t:
             first_elem = abc_tensors[0]
 
             if isinstance(first_elem, (list, tuple)):
-                # GROUP GEMM format: list of (a, b, c) tuples
-                # For DUAL GEMM, we need at least 2 groups: [(a, b1, c), (a, b2, c), ...]
-                # ROUND 13 FIX: Handle 2+ groups flexibly, use first 2 for DUAL GEMM
+                # ROUND 14 FIX: Detect GROUP GEMM vs DUAL GEMM by checking shapes
+                # GROUP GEMM: Each group has different dimensions (independent problems)
+                # DUAL GEMM: Groups share same A matrix and output C
+                import sys
                 num_groups = len(abc_tensors)
 
-                # Debug logging to understand production format
-                import sys
-                print(f"[DEBUG R13] abc_tensors has {num_groups} groups", file=sys.stderr)
-                for i, grp in enumerate(abc_tensors[:3]):  # Log first 3 groups max
-                    if isinstance(grp, (list, tuple)):
-                        shapes = [t.shape if hasattr(t, 'shape') else type(t) for t in grp]
-                        print(f"[DEBUG R13] Group {i}: {len(grp)} tensors, shapes={shapes}", file=sys.stderr)
+                # Check if groups share the same A matrix (DUAL GEMM) or have different A's (GROUP GEMM)
+                a0_shape = abc_tensors[0][0].shape if len(abc_tensors) > 0 else None
+                a1_shape = abc_tensors[1][0].shape if len(abc_tensors) > 1 else None
+                same_a = (a0_shape == a1_shape) if (a0_shape and a1_shape) else False
 
-                if num_groups >= 2:
-                    # DUAL GEMM: Extract from FIRST 2 groups
+                print(f"[DEBUG R14] {num_groups} groups, a0_shape={a0_shape}, a1_shape={a1_shape}, same_a={same_a}", file=sys.stderr)
+
+                if same_a and num_groups >= 2:
+                    # DUAL GEMM: Groups share A matrix
                     # Group 0: (a, b1, c) - First GEMM
-                    # Group 1: (a, b2, c) - Second GEMM (a and c are shared)
+                    # Group 1: (a, b2, c) - Second GEMM (a and c shared)
                     (a, b1, c) = abc_tensors[0]
-                    (_, b2, _) = abc_tensors[1]  # a and c are the same
+                    (_, b2, _) = abc_tensors[1]
 
-                    if num_groups > 2:
-                        print(f"[DEBUG R13] Ignoring {num_groups - 2} extra groups for DUAL GEMM", file=sys.stderr)
-
-                    # Scale factors: Use first 2 groups
                     num_sf_groups = len(sfasfb_reordered_tensors) if isinstance(sfasfb_reordered_tensors, (list, tuple)) else 0
-                    print(f"[DEBUG R13] sfasfb has {num_sf_groups} groups", file=sys.stderr)
-
                     if num_sf_groups >= 2:
                         (sfa_permuted, sfb1_permuted) = sfasfb_reordered_tensors[0]
-                        (_, sfb2_permuted) = sfasfb_reordered_tensors[1]  # sfa is the same
+                        (_, sfb2_permuted) = sfasfb_reordered_tensors[1]
                     else:
-                        raise ValueError(f"Expected at least 2 sfasfb groups, got {num_sf_groups}")
+                        raise ValueError(f"DUAL GEMM needs at least 2 sfasfb groups, got {num_sf_groups}")
+
+                    print(f"[DEBUG R14] DUAL GEMM mode: a={a.shape}, b1={b1.shape}, b2={b2.shape}, c={c.shape}", file=sys.stderr)
                 else:
-                    raise ValueError(f"DUAL GEMM needs at least 2 groups, got {num_groups}")
+                    # GROUP GEMM: Each group is an independent problem
+                    # Fall back to simple PyTorch scaled_mm for each group
+                    print(f"[DEBUG R14] GROUP GEMM mode: {num_groups} independent problems", file=sys.stderr)
+
+                    from common.scale_helpers import to_blocked
+
+                    for i, (abc_group, sf_group) in enumerate(zip(abc_tensors, sfasfb_reordered_tensors)):
+                        a_i, b_i, c_i = abc_group
+                        sfa_i, sfb_i = sf_group
+
+                        # For each group, run single scaled GEMM: c = a @ b
+                        # Handle the L dimension (batch)
+                        m_i, k_half_i, l_i = a_i.shape
+                        n_i = b_i.shape[0]
+
+                        for l_idx in range(l_i):
+                            # Get 2D slices
+                            a_2d = a_i[:, :, l_idx]
+                            b_2d = b_i[:, :, l_idx]
+
+                            # Scale factors need to be in blocked format
+                            sfa_2d = sfa_i[..., l_idx] if sfa_i.dim() > 2 else sfa_i
+                            sfb_2d = sfb_i[..., l_idx] if sfb_i.dim() > 2 else sfb_i
+
+                            # Use torch._scaled_mm for FP4 GEMM
+                            result = torch._scaled_mm(
+                                a_2d.contiguous(),
+                                b_2d.T.contiguous(),
+                                sfa_2d.contiguous(),
+                                sfb_2d.contiguous(),
+                                bias=None,
+                                out_dtype=torch.float32
+                            )
+                            c_i[:, :, l_idx] = result.to(torch.float16)
+
+                        print(f"[DEBUG R14] Group {i}: a={a_i.shape}, b={b_i.shape}, c={c_i.shape}", file=sys.stderr)
+
+                    # Return the last output (or first? need to determine)
+                    return abc_tensors[-1][2]
             elif hasattr(first_elem, 'data_ptr'):
                 # abc_tensors is a flat tuple of tensors: (a, b1, b2, c) or (a, b1, b2)
                 if len(abc_tensors) == 4:
