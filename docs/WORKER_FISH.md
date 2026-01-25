@@ -120,6 +120,25 @@
 
 ## WORKER FISH PROTOCOLS
 
+### ⚠️ CRITICAL: Submission Protocol
+
+**ALWAYS update the ONE `submission.py` file!**
+
+See [SUBMISSION_PROTOCOL.md](./SUBMISSION_PROTOCOL.md) for details.
+
+```
+DO NOT CREATE:  submission_santos.py, submission_okonkwo.py, etc.
+ALWAYS UPDATE:  submission.py (the one and only!)
+```
+
+Workflow:
+1. Implement in a LOCAL test file
+2. Validate with Bubbles
+3. If valid → UPDATE submission.py
+4. If invalid → Debug, don't touch submission.py
+
+---
+
 ### Communication Style
 
 All worker fish report in character:
