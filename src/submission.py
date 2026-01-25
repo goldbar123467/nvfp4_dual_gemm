@@ -1001,7 +1001,7 @@ def custom_kernel(data: input_t) -> output_t:
                         # Get batch dimension L
                         batch_dim = a_grp.shape[2] if a_grp.dim() >= 3 else 1
 
-                        print(f"[R15] Grp{grp_idx}: a={a_grp.shape} b={b_grp.shape} c={c_grp.shape} L={batch_dim}", file=sys.stderr)
+                        print(f"[R15] Grp{grp_idx}: a={a_grp.shape} b={b_grp.shape} c={c_grp.shape} sfa={sfa_grp.shape} sfb={sfb_grp.shape} L={batch_dim}", file=sys.stderr)
 
                         # Process each batch element
                         for batch_idx in range(batch_dim):
@@ -1013,16 +1013,34 @@ def custom_kernel(data: input_t) -> output_t:
                                 a_slice = a_grp
                                 b_slice = b_grp
 
-                            # Slice scale factors
-                            if sfa_grp.dim() >= 3:
+                            # Scale factors may be in permuted 6D format [32, 4, rest_m, 4, rest_k, l]
+                            # Need to convert to 2D [m, k//16] for torch._scaled_mm
+                            if sfa_grp.dim() == 6:
+                                # Permuted format: [32, 4, rest_m, 4, rest_k, l]
+                                sfa_slice = sfa_grp[..., batch_idx]  # [32, 4, rest_m, 4, rest_k]
+                                # Reshape to [m, k//16] where m = 32*4*rest_m, k//16 = 4*rest_k
+                                s = sfa_slice.shape
+                                sfa_slice = sfa_slice.permute(0, 2, 1, 3, 4).reshape(s[0]*s[2], s[1]*s[3]*s[4])
+                            elif sfa_grp.dim() >= 3:
                                 sfa_slice = sfa_grp[..., batch_idx]
+                                # Flatten to 2D if still >2D
+                                if sfa_slice.dim() > 2:
+                                    sfa_slice = sfa_slice.reshape(sfa_slice.shape[0], -1)
                             else:
                                 sfa_slice = sfa_grp
 
-                            if sfb_grp.dim() >= 3:
+                            if sfb_grp.dim() == 6:
                                 sfb_slice = sfb_grp[..., batch_idx]
+                                s = sfb_slice.shape
+                                sfb_slice = sfb_slice.permute(0, 2, 1, 3, 4).reshape(s[0]*s[2], s[1]*s[3]*s[4])
+                            elif sfb_grp.dim() >= 3:
+                                sfb_slice = sfb_grp[..., batch_idx]
+                                if sfb_slice.dim() > 2:
+                                    sfb_slice = sfb_slice.reshape(sfb_slice.shape[0], -1)
                             else:
                                 sfb_slice = sfb_grp
+
+                            print(f"[R15] Batch{batch_idx}: a_slice={a_slice.shape} b_slice={b_slice.shape} sfa_slice={sfa_slice.shape} sfb_slice={sfb_slice.shape}", file=sys.stderr)
 
                             # Scaled GEMM: result = a @ b.T with scaling
                             # NOTE: FP4 doesn't support .T.contiguous() - use transpose view
