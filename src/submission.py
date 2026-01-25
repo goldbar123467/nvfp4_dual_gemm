@@ -1053,11 +1053,17 @@ def custom_kernel(data: input_t) -> output_t:
                                 out_dtype=torch.float32
                             )
 
+                            # ROUND 16: Apply DUAL GEMM fusion even for GROUP GEMM
+                            # Since each group only has one B matrix, treat as B1 = B2 = B
+                            # Result = silu(gemm) * gemm
+                            silu_result = torch.nn.functional.silu(gemm_result)
+                            fused_result = silu_result * gemm_result
+
                             # Store result in output tensor
                             if c_grp.dim() >= 3:
-                                c_grp[:, :, batch_idx] = gemm_result.to(torch.float16)
+                                c_grp[:, :, batch_idx] = fused_result.to(torch.float16)
                             else:
-                                c_grp.copy_(gemm_result.to(torch.float16))
+                                c_grp.copy_(fused_result.to(torch.float16))
 
                         group_outputs.append(c_grp)
 
