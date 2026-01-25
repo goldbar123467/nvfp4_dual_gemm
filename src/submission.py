@@ -2,16 +2,14 @@
 NVFP4 Block-Scaled DUAL GEMM for NVIDIA B200
 CuTe DSL Implementation using CUTLASS
 
-VERSION: v10-dual-gemm-fused
-ROUND 10 FIX: Replace GROUP GEMM with proper DUAL GEMM kernel
+VERSION: v15-group-gemm-fallback-20260125-184900
+ROUND 15 FIX: Handle GROUP GEMM (independent problems) vs DUAL GEMM (shared A)
 
-C = silu(A @ B1) * (A @ B2)  -- FUSED IN SINGLE KERNEL
+Supports:
+- DUAL GEMM: C = silu(A @ B1) * (A @ B2) when groups share same A
+- GROUP GEMM: Independent c_i = a_i @ b_i when groups have different shapes
 
-Key differences from previous (broken) version:
-- Single kernel launch (not 2 + PyTorch fusion)
-- TWO accumulators (tCtAcc1, tCtAcc2)
-- Both B1 and B2 loaded together
-- SiLU fusion in epilogue
+NO EXTERNAL IMPORTS - All logic self-contained.
 """
 
 from torch._higher_order_ops.torchbind import call_torchbind_fake
@@ -978,58 +976,75 @@ def custom_kernel(data: input_t) -> output_t:
                     else:
                         raise ValueError(f"DUAL GEMM needs at least 2 sfasfb groups, got {num_sf_groups}")
 
-                    print(f"[DEBUG R14] DUAL GEMM mode: a={a.shape}, b1={b1.shape}, b2={b2.shape}, c={c.shape}", file=sys.stderr)
+                    print(f"[R15] DUAL_GEMM: a={a.shape} b1={b1.shape} b2={b2.shape} c={c.shape}", file=sys.stderr)
                 else:
-                    # GROUP GEMM: Each group is an independent problem
-                    # Fall back to simple PyTorch scaled_mm for each group
-                    print(f"[DEBUG R14] GROUP GEMM mode: {num_groups} independent problems", file=sys.stderr)
+                    # ============================================================
+                    # ROUND 15: GROUP GEMM FALLBACK - NO EXTERNAL IMPORTS
+                    # Each group is an independent scaled GEMM problem
+                    # Using ONLY torch._scaled_mm (built-in, no external modules)
+                    # ============================================================
+                    print(f"[R15] GROUP_GEMM: {num_groups} independent problems", file=sys.stderr)
 
-                    for i, (abc_group, sf_group) in enumerate(zip(abc_tensors, sfasfb_reordered_tensors)):
-                        a_i, b_i, c_i = abc_group
-                        sfa_i, sfb_i = sf_group
+                    # Process each group as independent GEMM: c_i = a_i @ b_i
+                    group_outputs = []
+                    for grp_idx in range(num_groups):
+                        # Extract tensors for this group
+                        grp_abc = abc_tensors[grp_idx]
+                        grp_sf = sfasfb_reordered_tensors[grp_idx]
 
-                        # For each group, run single scaled GEMM: c = a @ b
-                        # Handle the L dimension (batch)
-                        l_i = a_i.shape[2] if a_i.dim() > 2 else 1
+                        a_grp = grp_abc[0]  # Input A
+                        b_grp = grp_abc[1]  # Input B
+                        c_grp = grp_abc[2]  # Output C (pre-allocated)
+                        sfa_grp = grp_sf[0]  # Scale factor A
+                        sfb_grp = grp_sf[1]  # Scale factor B
 
-                        for l_idx in range(l_i):
-                            # Get 2D slices
-                            a_2d = a_i[:, :, l_idx] if a_i.dim() > 2 else a_i
-                            b_2d = b_i[:, :, l_idx] if b_i.dim() > 2 else b_i
+                        # Get batch dimension L
+                        batch_dim = a_grp.shape[2] if a_grp.dim() >= 3 else 1
 
-                            # Scale factors - handle various dimensions
-                            if sfa_i.dim() > 2:
-                                sfa_2d = sfa_i[..., l_idx]
-                            elif sfa_i.dim() == 2:
-                                sfa_2d = sfa_i
+                        print(f"[R15] Grp{grp_idx}: a={a_grp.shape} b={b_grp.shape} c={c_grp.shape} L={batch_dim}", file=sys.stderr)
+
+                        # Process each batch element
+                        for batch_idx in range(batch_dim):
+                            # Slice 2D matrices from 3D tensors
+                            if a_grp.dim() >= 3:
+                                a_slice = a_grp[:, :, batch_idx]
+                                b_slice = b_grp[:, :, batch_idx]
                             else:
-                                sfa_2d = sfa_i.view(-1, sfa_i.shape[-1]) if sfa_i.dim() > 0 else sfa_i
+                                a_slice = a_grp
+                                b_slice = b_grp
 
-                            if sfb_i.dim() > 2:
-                                sfb_2d = sfb_i[..., l_idx]
-                            elif sfb_i.dim() == 2:
-                                sfb_2d = sfb_i
+                            # Slice scale factors
+                            if sfa_grp.dim() >= 3:
+                                sfa_slice = sfa_grp[..., batch_idx]
                             else:
-                                sfb_2d = sfb_i.view(-1, sfb_i.shape[-1]) if sfb_i.dim() > 0 else sfb_i
+                                sfa_slice = sfa_grp
 
-                            # Use torch._scaled_mm for FP4 GEMM
-                            result = torch._scaled_mm(
-                                a_2d.contiguous(),
-                                b_2d.T.contiguous(),
-                                sfa_2d.contiguous(),
-                                sfb_2d.contiguous(),
+                            if sfb_grp.dim() >= 3:
+                                sfb_slice = sfb_grp[..., batch_idx]
+                            else:
+                                sfb_slice = sfb_grp
+
+                            # Scaled GEMM: result = a @ b.T with scaling
+                            gemm_result = torch._scaled_mm(
+                                a_slice.contiguous(),
+                                b_slice.T.contiguous(),
+                                sfa_slice.contiguous(),
+                                sfb_slice.contiguous(),
                                 bias=None,
                                 out_dtype=torch.float32
                             )
-                            if c_i.dim() > 2:
-                                c_i[:, :, l_idx] = result.to(torch.float16)
+
+                            # Store result in output tensor
+                            if c_grp.dim() >= 3:
+                                c_grp[:, :, batch_idx] = gemm_result.to(torch.float16)
                             else:
-                                c_i.copy_(result.to(torch.float16))
+                                c_grp.copy_(gemm_result.to(torch.float16))
 
-                        print(f"[DEBUG R14] Group {i}: a={a_i.shape}, b={b_i.shape}, c={c_i.shape}", file=sys.stderr)
+                        group_outputs.append(c_grp)
 
-                    # Return the last output (or first? need to determine)
-                    return abc_tensors[-1][2]
+                    # Return last group's output
+                    print(f"[R15] GROUP_GEMM complete, returning group {num_groups-1} output", file=sys.stderr)
+                    return group_outputs[-1]
             elif hasattr(first_elem, 'data_ptr'):
                 # abc_tensors is a flat tuple of tensors: (a, b1, b2, c) or (a, b1, b2)
                 if len(abc_tensors) == 4:
