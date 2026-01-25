@@ -1025,11 +1025,12 @@ def custom_kernel(data: input_t) -> output_t:
                                 sfb_slice = sfb_grp
 
                             # Scaled GEMM: result = a @ b.T with scaling
+                            # NOTE: FP4 doesn't support .T.contiguous() - use transpose view
                             gemm_result = torch._scaled_mm(
-                                a_slice.contiguous(),
-                                b_slice.T.contiguous(),
-                                sfa_slice.contiguous(),
-                                sfb_slice.contiguous(),
+                                a_slice,
+                                b_slice.transpose(0, 1),  # View, not copy
+                                sfa_slice,
+                                sfb_slice,
                                 bias=None,
                                 out_dtype=torch.float32
                             )
