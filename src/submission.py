@@ -952,21 +952,39 @@ def custom_kernel(data: input_t) -> output_t:
 
             if isinstance(first_elem, (list, tuple)):
                 # GROUP GEMM format: list of (a, b, c) tuples
-                # For DUAL GEMM, we have 2 groups: [(a, b1, c), (a, b2, c)]
-                if len(abc_tensors) == 2:
-                    # DUAL GEMM via 2 GROUP entries
+                # For DUAL GEMM, we need at least 2 groups: [(a, b1, c), (a, b2, c), ...]
+                # ROUND 13 FIX: Handle 2+ groups flexibly, use first 2 for DUAL GEMM
+                num_groups = len(abc_tensors)
+
+                # Debug logging to understand production format
+                import sys
+                print(f"[DEBUG R13] abc_tensors has {num_groups} groups", file=sys.stderr)
+                for i, grp in enumerate(abc_tensors[:3]):  # Log first 3 groups max
+                    if isinstance(grp, (list, tuple)):
+                        shapes = [t.shape if hasattr(t, 'shape') else type(t) for t in grp]
+                        print(f"[DEBUG R13] Group {i}: {len(grp)} tensors, shapes={shapes}", file=sys.stderr)
+
+                if num_groups >= 2:
+                    # DUAL GEMM: Extract from FIRST 2 groups
+                    # Group 0: (a, b1, c) - First GEMM
+                    # Group 1: (a, b2, c) - Second GEMM (a and c are shared)
                     (a, b1, c) = abc_tensors[0]
                     (_, b2, _) = abc_tensors[1]  # a and c are the same
 
-                    # Scale factors: 2 groups [(sfa_perm, sfb1_perm), (sfa_perm, sfb2_perm)]
-                    if isinstance(sfasfb_reordered_tensors, (list, tuple)) and len(sfasfb_reordered_tensors) == 2:
+                    if num_groups > 2:
+                        print(f"[DEBUG R13] Ignoring {num_groups - 2} extra groups for DUAL GEMM", file=sys.stderr)
+
+                    # Scale factors: Use first 2 groups
+                    num_sf_groups = len(sfasfb_reordered_tensors) if isinstance(sfasfb_reordered_tensors, (list, tuple)) else 0
+                    print(f"[DEBUG R13] sfasfb has {num_sf_groups} groups", file=sys.stderr)
+
+                    if num_sf_groups >= 2:
                         (sfa_permuted, sfb1_permuted) = sfasfb_reordered_tensors[0]
                         (_, sfb2_permuted) = sfasfb_reordered_tensors[1]  # sfa is the same
                     else:
-                        raise ValueError(f"Expected 2 sfasfb groups, got {len(sfasfb_reordered_tensors)}")
+                        raise ValueError(f"Expected at least 2 sfasfb groups, got {num_sf_groups}")
                 else:
-                    # More than 2 groups - unexpected for DUAL GEMM
-                    raise ValueError(f"DUAL GEMM expects 2 groups, got {len(abc_tensors)}")
+                    raise ValueError(f"DUAL GEMM needs at least 2 groups, got {num_groups}")
             elif hasattr(first_elem, 'data_ptr'):
                 # abc_tensors is a flat tuple of tensors: (a, b1, b2, c) or (a, b1, b2)
                 if len(abc_tensors) == 4:
