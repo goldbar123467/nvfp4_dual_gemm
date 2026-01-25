@@ -919,23 +919,96 @@ def custom_kernel(data: input_t) -> output_t:
     It converts PyTorch tensors to CuTe tensors, launches the kernel,
     and returns the result.
 
+    DUAL FORMAT SUPPORT:
+    - 10-element format (eval_test): (a, b1, b2, sfa, sfb1, sfb2, sfa_perm, sfb1_perm, sfb2_perm, c)
+    - 4-element format (production): (abc_tensors, _, sfasfb_reordered, problem_sizes)
+
     Args:
-        data: Tuple of (a, b1, b2, sfa_cpu, sfb1_cpu, sfb2_cpu, c) PyTorch tensors
-            a: [m, k, l] - Input matrix in float4e2m1fn
-            b1: [n, k, l] - Input matrix in float4e2m1fn
-            b2: [n, k, l] - Input matrix in float4e2m1fn
-            sfa_cpu: [m, k, l] - Scale factors in float8_e4m3fn, used by reference implementation
-            sfb1_cpu: [n, k, l] - Scale factors in float8_e4m3fn, used by reference implementation
-            sfb2_cpu: [n, k, l] - Scale factors in float8_e4m3fn, used by reference implementation
-            sfa_permuted: [32, 4, rest_m, 4, rest_k, l] - Scale factors in float8_e4m3fn
-            sfb1_permuted: [32, 4, rest_n, 4, rest_k, l] - Scale factors in float8_e4m3fn
-            sfb2_permuted: [32, 4, rest_n, 4, rest_k, l] - Scale factors in float8_e4m3fn
-            c: [m, n, l] - Output vector in float16
+        data: Tuple of input tensors in either format
 
     Returns:
         Output tensor c with computed results
     """
-    a, b1, b2, _, _, _, sfa_permuted, sfb1_permuted, sfb2_permuted, c = data
+    # DEFENSIVE FORMAT DETECTION - Handle both 10-element and 4-element formats
+    data_len = len(data)
+
+    if data_len == 10:
+        # eval_test format: flat unpacking of all tensors
+        # (a, b1, b2, sfa_cpu, sfb1_cpu, sfb2_cpu, sfa_perm, sfb1_perm, sfb2_perm, c)
+        a, b1, b2, _, _, _, sfa_permuted, sfb1_permuted, sfb2_permuted, c = data
+    elif data_len == 4:
+        # Production GPUMODE format: GROUP GEMM style with 2 groups for DUAL GEMM
+        # Element 0: abc_tensors - list of (a, b, c) tuples for each "group"
+        #            For DUAL GEMM: [(a, b1, c), (a, b2, c)] - 2 groups sharing a and c
+        # Element 1: _ - Unused (or CPU scale factors we don't need)
+        # Element 2: sfasfb_reordered_tensors - list of (sfa_perm, sfb_perm) tuples
+        #            For DUAL GEMM: [(sfa_perm, sfb1_perm), (sfa_perm, sfb2_perm)]
+        # Element 3: problem_sizes - list of (m, n, k, l) tuples
+        abc_tensors, _, sfasfb_reordered_tensors, problem_sizes = data
+
+        # Detect format: could be GROUP GEMM style (list of tuples) or flat tuple
+        if isinstance(abc_tensors, (list, tuple)) and len(abc_tensors) >= 2:
+            first_elem = abc_tensors[0]
+
+            if isinstance(first_elem, (list, tuple)):
+                # GROUP GEMM format: list of (a, b, c) tuples
+                # For DUAL GEMM, we have 2 groups: [(a, b1, c), (a, b2, c)]
+                if len(abc_tensors) == 2:
+                    # DUAL GEMM via 2 GROUP entries
+                    (a, b1, c) = abc_tensors[0]
+                    (_, b2, _) = abc_tensors[1]  # a and c are the same
+
+                    # Scale factors: 2 groups [(sfa_perm, sfb1_perm), (sfa_perm, sfb2_perm)]
+                    if isinstance(sfasfb_reordered_tensors, (list, tuple)) and len(sfasfb_reordered_tensors) == 2:
+                        (sfa_permuted, sfb1_permuted) = sfasfb_reordered_tensors[0]
+                        (_, sfb2_permuted) = sfasfb_reordered_tensors[1]  # sfa is the same
+                    else:
+                        raise ValueError(f"Expected 2 sfasfb groups, got {len(sfasfb_reordered_tensors)}")
+                else:
+                    # More than 2 groups - unexpected for DUAL GEMM
+                    raise ValueError(f"DUAL GEMM expects 2 groups, got {len(abc_tensors)}")
+            elif hasattr(first_elem, 'data_ptr'):
+                # abc_tensors is a flat tuple of tensors: (a, b1, b2, c) or (a, b1, b2)
+                if len(abc_tensors) == 4:
+                    a, b1, b2, c = abc_tensors
+                elif len(abc_tensors) == 3:
+                    a, b1, b2 = abc_tensors
+                    # Need to allocate c from problem_sizes
+                    if isinstance(problem_sizes, (list, tuple)):
+                        if isinstance(problem_sizes[0], (list, tuple)):
+                            m, n, k, l = problem_sizes[0]
+                        else:
+                            m, n, k, l = problem_sizes[:4]
+                    else:
+                        # Infer from tensor shapes
+                        m = a.shape[0]
+                        n = b1.shape[0]
+                        l = a.shape[2] if len(a.shape) > 2 else 1
+                    c = torch.empty((m, n, l), dtype=torch.float16, device='cuda')
+                else:
+                    raise ValueError(f"Unexpected abc_tensors length: {len(abc_tensors)}, expected 3 or 4")
+
+                # Extract scale factors - either flat tuple or list format
+                if isinstance(sfasfb_reordered_tensors, (list, tuple)):
+                    if len(sfasfb_reordered_tensors) == 3:
+                        sfa_permuted, sfb1_permuted, sfb2_permuted = sfasfb_reordered_tensors
+                    elif len(sfasfb_reordered_tensors) == 6:
+                        # Might include both raw and permuted
+                        _, _, _, sfa_permuted, sfb1_permuted, sfb2_permuted = sfasfb_reordered_tensors
+                    elif len(sfasfb_reordered_tensors) == 2 and isinstance(sfasfb_reordered_tensors[0], (list, tuple)):
+                        # GROUP format: [(sfa, sfb1), (sfa, sfb2)]
+                        (sfa_permuted, sfb1_permuted) = sfasfb_reordered_tensors[0]
+                        (_, sfb2_permuted) = sfasfb_reordered_tensors[1]
+                    else:
+                        raise ValueError(f"Unexpected sfasfb_reordered_tensors format, length={len(sfasfb_reordered_tensors)}")
+                else:
+                    raise ValueError(f"sfasfb_reordered_tensors must be list/tuple, got {type(sfasfb_reordered_tensors)}")
+            else:
+                raise ValueError(f"Unexpected first element type in abc_tensors: {type(first_elem)}")
+        else:
+            raise ValueError(f"abc_tensors must be list/tuple with at least 2 elements, got {type(abc_tensors)} with len={len(abc_tensors) if hasattr(abc_tensors, '__len__') else 'N/A'}")
+    else:
+        raise ValueError(f"Unexpected data format: got {data_len} elements, expected 4 or 10")
 
     # Ensure kernel is compiled (will use cached version if available)
     # To avoid the compilation overhead, we compile the kernel once and cache it.
