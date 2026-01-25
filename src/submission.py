@@ -960,7 +960,7 @@ def custom_kernel(data: input_t) -> output_t:
                 a1_shape = abc_tensors[1][0].shape if len(abc_tensors) > 1 else None
                 same_a = (a0_shape == a1_shape) if (a0_shape and a1_shape) else False
 
-                print(f"[DEBUG R14] {num_groups} groups, a0_shape={a0_shape}, a1_shape={a1_shape}, same_a={same_a}", file=sys.stderr)
+                print(f"[DEBUG R17] {num_groups} groups, a0_shape={a0_shape}, a1_shape={a1_shape}, same_a={same_a}", file=sys.stderr)
 
                 if same_a and num_groups >= 2:
                     # DUAL GEMM: Groups share A matrix
@@ -976,14 +976,14 @@ def custom_kernel(data: input_t) -> output_t:
                     else:
                         raise ValueError(f"DUAL GEMM needs at least 2 sfasfb groups, got {num_sf_groups}")
 
-                    print(f"[R15] DUAL_GEMM: a={a.shape} b1={b1.shape} b2={b2.shape} c={c.shape}", file=sys.stderr)
+                    print(f"[R17] DUAL_GEMM: a={a.shape} b1={b1.shape} b2={b2.shape} c={c.shape}", file=sys.stderr)
                 else:
                     # ============================================================
                     # ROUND 15: GROUP GEMM FALLBACK - NO EXTERNAL IMPORTS
                     # Each group is an independent scaled GEMM problem
                     # Using ONLY torch._scaled_mm (built-in, no external modules)
                     # ============================================================
-                    print(f"[R15] GROUP_GEMM: {num_groups} independent problems", file=sys.stderr)
+                    print(f"[R17] GROUP_GEMM: {num_groups} independent problems", file=sys.stderr)
 
                     # Process each group as independent GEMM: c_i = a_i @ b_i
                     group_outputs = []
@@ -1001,7 +1001,7 @@ def custom_kernel(data: input_t) -> output_t:
                         # Get batch dimension L
                         batch_dim = a_grp.shape[2] if a_grp.dim() >= 3 else 1
 
-                        print(f"[R15] Grp{grp_idx}: a={a_grp.shape} b={b_grp.shape} c={c_grp.shape} sfa={sfa_grp.shape} sfb={sfb_grp.shape} L={batch_dim}", file=sys.stderr)
+                        print(f"[R17] Grp{grp_idx}: a={a_grp.shape} b={b_grp.shape} c={c_grp.shape} sfa={sfa_grp.shape} sfb={sfb_grp.shape} L={batch_dim}", file=sys.stderr)
 
                         # Process each batch element
                         for batch_idx in range(batch_dim):
@@ -1040,7 +1040,7 @@ def custom_kernel(data: input_t) -> output_t:
                             else:
                                 sfb_slice = sfb_grp
 
-                            print(f"[R15] Batch{batch_idx}: a_slice={a_slice.shape} b_slice={b_slice.shape} sfa_slice={sfa_slice.shape} sfb_slice={sfb_slice.shape}", file=sys.stderr)
+                            print(f"[R17] Batch{batch_idx}: a_slice={a_slice.shape} b_slice={b_slice.shape} sfa_slice={sfa_slice.shape} sfb_slice={sfb_slice.shape}", file=sys.stderr)
 
                             # Scaled GEMM: result = a @ b.T with scaling
                             # NOTE: FP4 doesn't support .T.contiguous() - use transpose view
@@ -1053,22 +1053,20 @@ def custom_kernel(data: input_t) -> output_t:
                                 out_dtype=torch.float32
                             )
 
-                            # ROUND 16: Apply DUAL GEMM fusion even for GROUP GEMM
-                            # Since each group only has one B matrix, treat as B1 = B2 = B
-                            # Result = silu(gemm) * gemm
-                            silu_result = torch.nn.functional.silu(gemm_result)
-                            fused_result = silu_result * gemm_result
+                            # ROUND 17: GROUP GEMM = plain scaled matmul (no silu fusion)
+                            # Each group is independent: C_i = A_i @ B_i
+                            # The DUAL GEMM formula only applies when we have B1 AND B2
 
                             # Store result in output tensor
                             if c_grp.dim() >= 3:
-                                c_grp[:, :, batch_idx] = fused_result.to(torch.float16)
+                                c_grp[:, :, batch_idx] = gemm_result.to(torch.float16)
                             else:
-                                c_grp.copy_(fused_result.to(torch.float16))
+                                c_grp.copy_(gemm_result.to(torch.float16))
 
                         group_outputs.append(c_grp)
 
                     # Return last group's output
-                    print(f"[R15] GROUP_GEMM complete, returning group {num_groups-1} output", file=sys.stderr)
+                    print(f"[R17] GROUP_GEMM complete, returning group {num_groups-1} output", file=sys.stderr)
                     return group_outputs[-1]
             elif hasattr(first_elem, 'data_ptr'):
                 # abc_tensors is a flat tuple of tensors: (a, b1, b2, c) or (a, b1, b2)
